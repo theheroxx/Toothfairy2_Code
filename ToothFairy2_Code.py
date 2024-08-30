@@ -3,69 +3,88 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 from PIL import Image
-from torchvision.models.detection import maskrcnn_resnet50_fpn
-import matplotlib.pyplot as plt
 import numpy as np
+from torchvision.models.detection import maskrcnn_resnet50_fpn
 from torch import nn
+import matplotlib.pyplot as plt
 from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
 from torchvision.models.detection.mask_rcnn import MaskRCNNPredictor
+import json
+
 
 class CTScanDataset(Dataset):
-    def __init__(self, image_dir, label_dir, transforms=None):
+    def __init__(self, image_dir, label_dir, json_path, transforms=None):
         self.image_dir = image_dir
         self.label_dir = label_dir
         self.transforms = transforms
         self.image_filenames = sorted(os.listdir(image_dir))
         self.label_filenames = sorted(os.listdir(label_dir))
 
+        # Load label information from JSON
+        with open(json_path, 'r') as f:  # Corrected the mode to 'r'
+            self.label_info = json.load(f)["labels"]
+            
 
     def __len__(self):
         return len(self.image_filenames)
     
-
     def __getitem__(self, idx):
         img_path = os.path.join(self.image_dir, self.image_filenames[idx])
         label_path = os.path.join(self.label_dir, self.label_filenames[idx])
 
         # Load image as grayscale (1 channel)
         image = Image.open(img_path).convert("L")
+        
+        # Load label image and map it to class indices
         label = Image.open(label_path)
+        label = torch.tensor(np.array(label), dtype=torch.uint8)
+        
+        # Ensure the label is in the range of class indices [0, 41]
+        label = torch.clamp(label, min=0, max=41).long()
 
         if self.transforms is not None:
             image = self.transforms(image)
 
-        label = torch.tensor(np.array(label), dtype=torch.uint8)
-        label = (label > 0).float() # binary mask
-
-        # Check if the mask is empty
-        pos = torch.nonzero(label)
-        if pos.numel() == 0:
-            # If the mask is empty, return a dummy target or skip this item
-            boxes = torch.zeros((0, 4), dtype=torch.float32)
-            labels = torch.zeros((0,), dtype=torch.int64)
-            masks = torch.zeros((0, label.shape[0], label.shape[1]), dtype=torch.uint8)
-        else:
-            xmin = torch.min(pos[:, 1])
-            xmax = torch.max(pos[:, 1])
-            ymin = torch.min(pos[:, 0])
-            ymax = torch.max(pos[:, 0])
-            boxes = torch.tensor([[xmin, ymin, xmax, ymax]], dtype=torch.float32)
-            labels = torch.ones((1,), dtype=torch.int64)
-            masks = label.unsqueeze(0)  # Add channel dimension
-
+        # Generate target
         target = {
-            "boxes": boxes,
-            "labels": labels,
-            "masks": masks
+            "masks": label.unsqueeze(0),  # Add channel dimension
+            "labels": label.unique(),      # Extract unique class labels from mask
+            "boxes": self._get_bounding_boxes(label) # Compute bounding boxes
         }
 
         return image, target
     
+    def _get_bounding_boxes(self, label):
+        """Generate bounding boxes for each class in the label."""
+        boxes = []
+        unique_classes = label.unique()
 
-def get_data_loaders(image_dir, label_dir, batch_size=4):
+        for cls in unique_classes:
+            if cls == 0:
+                continue  # Skip background class
+
+            pos = torch.nonzero(label == cls)
+            if pos.numel() > 0:
+                xmin = torch.min(pos[:, 1])
+                xmax = torch.max(pos[:, 1])
+                ymin = torch.min(pos[:, 0])
+                ymax = torch.max(pos[:, 0])
+                boxes.append([xmin, ymin, xmax, ymax])
+
+        if len(boxes) == 0:
+            boxes = torch.zeros((0, 4), dtype=torch.float32)
+        else:
+            boxes = torch.tensor(boxes, dtype=torch.float32)
+
+        return boxes
+
+
+
+def get_data_loaders(image_dir, label_dir, json_path, batch_size=4):
     dataset = CTScanDataset(
         image_dir=image_dir,
         label_dir=label_dir,
+        json_path=json_path,
         transforms=transforms.Compose([
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.5], std=[0.5])  # Normalization for grayscale images
@@ -175,15 +194,16 @@ if __name__ == "__main__":
     # Paths
     image_dir = './data/sample/slices/test/im1'
     label_dir = './data/sample/slices/test/lb1'
+    json_path = './data/sample/dataset.json'  
     output_dir = './data/sample/slices/test/rs1'
 
     # Parameters
     num_classes = 42  # Background + 41 classes
-    num_epochs = 1
-    batch_size = 2 #5
+    num_epochs = 3
+    batch_size = 4
 
     # Get data loaders
-    dataloader = get_data_loaders(image_dir, label_dir, batch_size)
+    dataloader = get_data_loaders(image_dir, label_dir, json_path, batch_size)
 
     # Initialize model
     model = get_model(num_classes)

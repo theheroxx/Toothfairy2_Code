@@ -26,45 +26,47 @@ class CTScanDataset(Dataset):
         img_path = os.path.join(self.image_dir, self.image_filenames[idx])
         label_path = os.path.join(self.label_dir, self.label_filenames[idx])
 
-        # Load image as RGB (3 channels expected by Mask R-CNN)
-        image = Image.open(img_path).convert("RGB")
+        # Load image as grayscale (1 channel)
+        image = Image.open(img_path).convert("L")
         label = Image.open(label_path)
 
         if self.transforms is not None:
             image = self.transforms(image)
 
-        # Convert the label to a tensor, assuming labels are already in the range 0 to num_classes-1
         label = torch.tensor(np.array(label), dtype=torch.uint8)
 
-        # Find all unique classes in the label
-        unique_classes = torch.unique(label)
-        
-        # Prepare boxes, labels, and masks
+        # Generate boxes and labels for each class separately
         boxes = []
         labels = []
         masks = []
 
-        for cls in unique_classes:
-            if cls == 0:  # Skip background class if it exists
-                continue
-            
-            cls_mask = (label == cls).float()  # Binary mask for the class
-            pos = torch.nonzero(cls_mask)
+        for class_id in range(1, 42):  # Assuming class IDs are 1 to 41
+            class_mask = (label == class_id).float()
+
+            pos = torch.nonzero(class_mask)
             if pos.numel() == 0:
                 continue
-            
+
             xmin = torch.min(pos[:, 1])
             xmax = torch.max(pos[:, 1])
             ymin = torch.min(pos[:, 0])
             ymax = torch.max(pos[:, 0])
 
-            boxes.append([xmin.item(), ymin.item(), xmax.item(), ymax.item()])
-            labels.append(cls.item())
-            masks.append(cls_mask)
+            # Ensure the bounding box has positive height and width
+            if xmax > xmin and ymax > ymin:
+                boxes.append([xmin, ymin, xmax, ymax])
+                labels.append(class_id)
+                masks.append(class_mask)
 
-        boxes = torch.tensor(boxes, dtype=torch.float32)
-        labels = torch.tensor(labels, dtype=torch.int64)
-        masks = torch.stack(masks)  # Stack all class masks
+        if len(boxes) == 0:
+            # If no class was found, return a dummy target
+            boxes = torch.zeros((0, 4), dtype=torch.float32)
+            labels = torch.zeros((0,), dtype=torch.int64)
+            masks = torch.zeros((0, label.shape[0], label.shape[1]), dtype=torch.uint8)
+        else:
+            boxes = torch.tensor(boxes, dtype=torch.float32)
+            labels = torch.tensor(labels, dtype=torch.int64)
+            masks = torch.stack(masks)
 
         target = {
             "boxes": boxes,
@@ -73,16 +75,17 @@ class CTScanDataset(Dataset):
         }
 
         return image, target
+
     
 
-# Updated DataLoader with Data Augmentation and Train/Test Split
+# DataLoader with Data Augmentation and Train/Test Split
 def get_data_loaders(image_dir, label_dir, batch_size=4, split_ratio=0.75):
     dataset = CTScanDataset(
         image_dir=image_dir,
         label_dir=label_dir,
         transforms=transforms.Compose([
             transforms.ToTensor(),
-            transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])  # Normalization for RGB images
+            transforms.Normalize(mean=[0.5], std=[0.5])  # Normalization for grayscale images
         ])
     )
 
@@ -96,9 +99,9 @@ def get_data_loaders(image_dir, label_dir, batch_size=4, split_ratio=0.75):
     
     return train_loader, test_loader
 
-# Updated Model with ResNet-50 Backbone and Mask Predictor
+# Model with ResNet-50 Backbone
 def get_model(num_classes):
-    model = maskrcnn_resnet50_fpn(pretrained=True)  # Using ResNet-50 backbone
+    model = maskrcnn_resnet50_fpn(pretrained=True)
 
     # Replace the pre-trained head with a new one for the specific number of classes
     in_features = model.roi_heads.box_predictor.cls_score.in_features
@@ -111,14 +114,15 @@ def get_model(num_classes):
 
     return model
 
-# Updated Training with Adam Optimizer
+
+
+
+# Training with Adam Optimizer
 def train_model(model, dataloader, num_epochs, device="cuda"):
     model.to(device)
     params = [p for p in model.parameters() if p.requires_grad]
     
-    # Replaced SGD with Adam optimizer
-    optimizer = torch.optim.Adam(params, lr=0.0001)  # Adam optimizer with learning rate of 0.0001
-    
+    optimizer = torch.optim.Adam(params, lr=0.0001)
     lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.1)
 
     writer = SummaryWriter()
@@ -157,7 +161,7 @@ def train_model(model, dataloader, num_epochs, device="cuda"):
 
     writer.close()
 
-# Updated Save Predictions with Simple Thresholding Post-Processing
+# Save Predictions with Simple Thresholding Post-Processing
 def save_predictions(model, dataloader, output_dir, device="cuda"):
     model.eval()
     os.makedirs(output_dir, exist_ok=True)
@@ -168,32 +172,44 @@ def save_predictions(model, dataloader, output_dir, device="cuda"):
             outputs = model(images)
 
             for j, output in enumerate(outputs):
-                masks_pred = output['masks'].squeeze().cpu().numpy()
+                masks_pred = output['masks'].cpu().numpy()
+
+                # Combine all predicted masks into a single mask
+                combined_mask = np.zeros(masks_pred.shape[2:], dtype=np.uint8)  # Remove the channel dimension
+                for k in range(masks_pred.shape[0]):
+                    pred_mask = (masks_pred[k].squeeze() > 0.5).astype(np.uint8)
+                    combined_mask = np.maximum(combined_mask, pred_mask * (k + 1))  # Assign each class a unique value
 
                 fig, axes = plt.subplots(1, 3, figsize=(15, 5))
 
                 # Plot original image
                 image = images[j].squeeze().cpu().numpy()  # For grayscale, remove channel dimension
-                axes[0].imshow(np.transpose(image, (1, 2, 0)))  # Transpose for RGB images
+                axes[0].imshow(image, cmap='gray')
                 axes[0].set_title('Original Image')
                 axes[0].axis('off')
 
-                # Plot original mask
-                mask = targets[j]['masks'].squeeze().cpu().numpy()
-                axes[1].imshow(mask, cmap='gray')
-                axes[1].set_title('Original Mask')
+                # Plot original mask (combined across all channels)
+                if 'masks' in targets[j] and len(targets[j]['masks']) > 0:
+                    original_mask_combined = torch.max(targets[j]['masks'], dim=0).values.squeeze().cpu().numpy()
+                else:
+                    original_mask_combined = np.zeros_like(image)
+                axes[1].imshow(original_mask_combined, cmap='gray')
+                axes[1].set_title('Original Mask (Combined)')
                 axes[1].axis('off')
 
-                # Plot predicted mask with thresholding post-processing
-                pred_mask = masks_pred[0] if masks_pred.ndim == 3 else masks_pred
-                pred_mask = (pred_mask > 0.5).astype(np.uint8)  # Simple thresholding
-                axes[2].imshow(pred_mask, cmap='gray')
-                axes[2].set_title('Predicted Mask')
+                # Plot combined predicted mask (now 2D)
+                axes[2].imshow(combined_mask, cmap='gray')
+                axes[2].set_title('Combined Predicted Mask')
                 axes[2].axis('off')
 
                 plt.show()
 
                 plt.savefig(os.path.join(output_dir, f"result_{i}_{j}.png"), bbox_inches='tight', pad_inches=0)
+                plt.close()
+
+
+
+
 
 if __name__ == "__main__":
     # Paths
@@ -203,8 +219,8 @@ if __name__ == "__main__":
 
     # Parameters
     num_classes = 42  # Background + 41 classes
-    num_epochs = 8  # Number of epochs for training
-    batch_size = 4  # Batch size
+    num_epochs = 1
+    batch_size = 4
 
     # Get data loaders
     train_loader, test_loader = get_data_loaders(image_dir, label_dir, batch_size)
